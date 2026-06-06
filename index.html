@@ -1,0 +1,1904 @@
+#!/bin/bash
+# ===============================================
+# Yalla Kora V4 - النسخة النهائية المُصحَّحة
+# جميع التحسينات + إصلاح جميع المشاكل المذكورة
+# ===============================================
+
+set -e  # إيقاف السكربت عند أي خطأ
+
+echo "🚀 إنشاء مشروع Yalla Kora V4..."
+
+# إنشاء هيكل المجلدات
+mkdir -p yalla-kora/backend/{api,services,middleware,utils}
+mkdir -p yalla-kora/frontend/public
+mkdir -p yalla-kora/frontend/src/{api,assets,components,context,hooks,pages,styles,utils}
+
+# ==============================================
+# BACKEND
+# ==============================================
+
+# package.json
+cat > yalla-kora/backend/package.json << 'EOF'
+{
+  "name": "yalla-kora-backend",
+  "version": "4.0.0",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.0",
+    "helmet": "^7.1.0",
+    "node-cache": "^5.1.2",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+EOF
+
+# .env.example
+cat > yalla-kora/backend/.env.example << 'EOF'
+FOOTBALL_API_KEY=your_api_football_key
+NEWS_API_KEY=your_newsapi_key
+NEWS_FALLBACK_API_KEY=optional_fallback_key
+CORS_ORIGIN=http://localhost:5173
+PORT=3001
+EOF
+
+# ============ UTILS ============
+# logger.js
+cat > yalla-kora/backend/utils/logger.js << 'EOF'
+const winston = require('winston');
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({ format: winston.format.simple() })
+  ]
+});
+
+module.exports = logger;
+EOF
+
+# dataNormalizer.js
+cat > yalla-kora/backend/utils/dataNormalizer.js << 'EOF'
+function normalizeFixture(raw) {
+  if (!raw) return null;
+  return {
+    id: raw.fixture?.id,
+    date: raw.fixture?.date,
+    status: raw.fixture?.status?.short || 'NS',
+    homeTeam: {
+      id: raw.teams?.home?.id,
+      name: raw.teams?.home?.name,
+      logo: raw.teams?.home?.logo
+    },
+    awayTeam: {
+      id: raw.teams?.away?.id,
+      name: raw.teams?.away?.name,
+      logo: raw.teams?.away?.logo
+    },
+    goals: {
+      home: raw.goals?.home ?? null,
+      away: raw.goals?.away ?? null
+    },
+    league: raw.league?.name
+  };
+}
+
+function normalizeTeam(raw) {
+  if (!raw) return null;
+  return {
+    id: raw.team?.id,
+    name: raw.team?.name,
+    logo: raw.team?.logo,
+    country: raw.team?.country
+  };
+}
+
+function normalizeStanding(raw) {
+  if (!raw) return null;
+  return {
+    rank: raw.rank,
+    team: {
+      id: raw.team?.id,
+      name: raw.team?.name,
+      logo: raw.team?.logo
+    },
+    played: raw.all?.played,
+    win: raw.all?.win,
+    draw: raw.all?.draw,
+    lose: raw.all?.lose,
+    goalsFor: raw.all?.goals?.for,
+    goalsAgainst: raw.all?.goals?.against,
+    goalsDiff: raw.goalsDiff,
+    points: raw.points,
+    form: raw.form
+  };
+}
+
+module.exports = { normalizeFixture, normalizeTeam, normalizeStanding };
+EOF
+
+# ============ MIDDLEWARE ============
+# security.js (helmet + CORS whitelist)
+cat > yalla-kora/backend/middleware/security.js << 'EOF'
+const helmet = require('helmet');
+const cors = require('cors');
+
+const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+
+module.exports = [
+  helmet(),
+  cors({ origin: corsOrigin, optionsSuccessStatus: 200 })
+];
+EOF
+
+# validation.js (مُصحَّح - يرجع middleware صحيح)
+cat > yalla-kora/backend/middleware/validation.js << 'EOF'
+/**
+ * Middleware للتحقق من وجود معاملات غير مسموح بها في query
+ * @param {string[]} allowedParams - قائمة المعاملات المسموحة
+ */
+function validateParams(allowedParams) {
+  return (req, res, next) => {
+    const invalid = Object.keys(req.query).filter(p => !allowedParams.includes(p));
+    if (invalid.length > 0) {
+      return res.status(400).json({
+        error: `معاملات غير صالحة: ${invalid.join(', ')}`
+      });
+    }
+    next();
+  };
+}
+
+module.exports = validateParams;
+EOF
+
+# ============ SERVICES ============
+# cacheService.js
+cat > yalla-kora/backend/services/cacheService.js << 'EOF'
+const NodeCache = require('node-cache');
+const logger = require('../utils/logger');
+
+const cache = new NodeCache({
+  stdTTL: 300,
+  checkperiod: 60,
+  useClones: false,
+  deleteOnExpire: true
+});
+
+cache.on('expired', (key) => {
+  logger.debug(`Cache expired: ${key}`);
+});
+
+module.exports = cache;
+EOF
+
+# footballService.js (مُصحَّح بالكامل)
+cat > yalla-kora/backend/services/footballService.js << 'EOF'
+const axios = require('axios');
+const cache = require('./cacheService');
+const { normalizeFixture, normalizeTeam, normalizeStanding } = require('../utils/dataNormalizer');
+const logger = require('../utils/logger');
+
+const API_KEY = process.env.FOOTBALL_API_KEY;
+if (!API_KEY) {
+  logger.error('FOOTBALL_API_KEY is missing from environment');
+}
+const BASE_URL = 'https://v3.football.api-sports.io';
+const headers = { 'x-apisports-key': API_KEY };
+
+function getCurrentSeason() {
+  const now = new Date();
+  return now.getMonth() < 6 ? now.getFullYear() - 1 : now.getFullYear();
+}
+
+/**
+ * تخزين آمن في الكاش (يمنع تخزين البيانات الفارغة)
+ */
+function safeCacheSet(key, data, ttl = 300) {
+  if (data && (!Array.isArray(data) || data.length > 0)) {
+    cache.set(key, data, ttl);
+  } else {
+    logger.debug(`Skipping cache set for empty data: ${key}`);
+  }
+}
+
+// --------------------- Public API ---------------------
+async function fetchTodayMatches() {
+  const cacheKey = 'matches_today';
+  let matches = cache.get(cacheKey);
+  if (matches) return matches;
+
+  const today = new Date().toISOString().split('T')[0];
+  const { data } = await axios.get(`${BASE_URL}/fixtures`, {
+    headers,
+    params: { date: today, timezone: 'Asia/Riyadh' }
+  });
+
+  matches = (data.response || []).map(normalizeFixture);
+  safeCacheSet(cacheKey, matches, 300);
+  return matches; // مصفوفة
+}
+
+async function fetchLiveMatches() {
+  const cacheKey = 'matches_live';
+  let matches = cache.get(cacheKey);
+  if (matches) return matches;
+
+  const { data } = await axios.get(`${BASE_URL}/fixtures`, {
+    headers,
+    params: { live: 'all' }
+  });
+
+  matches = (data.response || []).map(normalizeFixture);
+  safeCacheSet(cacheKey, matches, 60);
+  return matches; // مصفوفة
+}
+
+async function fetchUpcomingMatches({ page = 1, limit = 10 } = {}) {
+  const cacheKey = 'matches_upcoming_raw';
+  let allMatches = cache.get(cacheKey);
+
+  if (!allMatches) {
+    const today = new Date().toISOString().split('T')[0];
+    const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const { data } = await axios.get(`${BASE_URL}/fixtures`, {
+      headers,
+      params: {
+        from: today,
+        to: nextWeek,
+        season: getCurrentSeason()
+      }
+    });
+    allMatches = (data.response || []).map(normalizeFixture);
+    safeCacheSet(cacheKey, allMatches, 600);
+  }
+
+  // Pagination محلي
+  const start = (page - 1) * limit;
+  const paginated = allMatches.slice(start, start + limit);
+  return {
+    data: paginated,
+    pagination: {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      total: allMatches.length,
+      totalPages: Math.ceil(allMatches.length / limit)
+    }
+  };
+}
+
+async function fetchFinishedMatches({ page = 1, limit = 10 } = {}) {
+  const cacheKey = 'matches_finished_raw';
+  let allMatches = cache.get(cacheKey);
+
+  if (!allMatches) {
+    const today = new Date().toISOString().split('T')[0];
+    const lastWeek = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const { data } = await axios.get(`${BASE_URL}/fixtures`, {
+      headers,
+      params: {
+        from: lastWeek,
+        to: today,
+        status: 'FT-AET-PEN',
+        season: getCurrentSeason()
+      }
+    });
+    allMatches = (data.response || []).map(normalizeFixture);
+    safeCacheSet(cacheKey, allMatches, 1800);
+  }
+
+  const start = (page - 1) * limit;
+  const paginated = allMatches.slice(start, start + limit);
+  return {
+    data: paginated,
+    pagination: {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      total: allMatches.length,
+      totalPages: Math.ceil(allMatches.length / limit)
+    }
+  };
+}
+
+async function fetchStandings(leagueId, season) {
+  const ss = season || getCurrentSeason();
+  const cacheKey = `standings_${leagueId}_${ss}`;
+  let standings = cache.get(cacheKey);
+  if (standings) return standings;
+
+  const { data } = await axios.get(`${BASE_URL}/standings`, {
+    headers,
+    params: { league: leagueId, season: ss }
+  });
+  const raw = data.response?.[0]?.league?.standings?.[0] || [];
+  standings = raw.map(normalizeStanding);
+  safeCacheSet(cacheKey, standings, 3600);
+  return standings;
+}
+
+async function fetchTeam(teamId) {
+  const cacheKey = `team_${teamId}`;
+  let result = cache.get(cacheKey);
+  if (result) return result;
+
+  const [teamRes, fixturesRes] = await Promise.all([
+    axios.get(`${BASE_URL}/teams`, { headers, params: { id: teamId } }),
+    axios.get(`${BASE_URL}/fixtures`, { headers, params: { team: teamId, last: 5 } })
+  ]);
+
+  result = {
+    team: normalizeTeam(teamRes.data.response?.[0]),
+    recentFixtures: (fixturesRes.data.response || []).filter(Boolean).map(normalizeFixture)
+  };
+  safeCacheSet(cacheKey, result, 1800);
+  return result;
+}
+
+async function fetchLeagues() {
+  const cacheKey = 'leagues';
+  let leagues = cache.get(cacheKey);
+  if (leagues) return leagues;
+
+  const { data } = await axios.get(`${BASE_URL}/leagues`, {
+    headers,
+    params: { current: 'true' }
+  });
+  leagues = (data.response || []).map(item => ({
+    id: item.league.id,
+    name: item.league.name,
+    logo: item.league.logo,
+    country: item.country?.name
+  }));
+  safeCacheSet(cacheKey, leagues, 86400);
+  return leagues;
+}
+
+async function searchTeams(query) {
+  const { data } = await axios.get(`${BASE_URL}/teams`, {
+    headers,
+    params: { search: query }
+  });
+  return (data.response || []).map(t => ({
+    id: t.team.id,
+    name: t.team.name,
+    logo: t.team.logo
+  }));
+}
+
+async function searchLeagues(query) {
+  const { data } = await axios.get(`${BASE_URL}/leagues`, {
+    headers,
+    params: { search: query }
+  });
+  return (data.response || []).map(l => ({
+    id: l.league.id,
+    name: l.league.name,
+    logo: l.league.logo
+  }));
+}
+
+async function searchFixtures(query) {
+  // نبحث عن الفرق أولاً ثم نأخذ مباريات أول فريق مطابق
+  const teams = await searchTeams(query);
+  if (teams.length === 0) return [];
+
+  const teamId = teams[0].id;
+  const { data } = await axios.get(`${BASE_URL}/fixtures`, {
+    headers,
+    params: { team: teamId, last: 10 }
+  });
+  return (data.response || []).filter(Boolean).map(normalizeFixture);
+}
+
+module.exports = {
+  fetchTodayMatches,
+  fetchLiveMatches,
+  fetchUpcomingMatches,
+  fetchFinishedMatches,
+  fetchStandings,
+  fetchTeam,
+  fetchLeagues,
+  searchTeams,
+  searchLeagues,
+  searchFixtures
+};
+EOF
+
+# newsService.js (مع مصدر بديل اختياري)
+cat > yalla-kora/backend/services/newsService.js << 'EOF'
+const axios = require('axios');
+const cache = require('./cacheService');
+const logger = require('../utils/logger');
+
+const NEWS_API_KEY = process.env.NEWS_API_KEY;
+const NEWS_FALLBACK_API_KEY = process.env.NEWS_FALLBACK_API_KEY;
+
+async function fetchFootballNews() {
+  const cacheKey = 'football_news';
+  let news = cache.get(cacheKey);
+  if (news) return news;
+
+  try {
+    const { data } = await axios.get('https://newsapi.org/v2/top-headlines', {
+      params: {
+        apiKey: NEWS_API_KEY,
+        category: 'sports',
+        q: 'كرة القدم',
+        language: 'ar',
+        pageSize: 20
+      }
+    });
+    news = data.articles || [];
+  } catch (primaryError) {
+    logger.warn('NewsAPI failed, trying fallback...');
+    if (NEWS_FALLBACK_API_KEY) {
+      const { data } = await axios.get('https://newsdata.io/api/1/news', {
+        params: {
+          apikey: NEWS_FALLBACK_API_KEY,
+          q: 'كرة القدم',
+          language: 'ar',
+          category: 'sports'
+        }
+      });
+      news = data.results || [];
+    } else {
+      throw primaryError;
+    }
+  }
+
+  cache.set(cacheKey, news, 600);
+  return news;
+}
+
+async function fetchAlAhlyNews() {
+  const cacheKey = 'al_ahly_news';
+  let news = cache.get(cacheKey);
+  if (news) return news;
+
+  const { data } = await axios.get('https://newsapi.org/v2/everything', {
+    params: {
+      apiKey: NEWS_API_KEY,
+      q: 'الأهلي المصري OR النادي الأهلي',
+      language: 'ar',
+      sortBy: 'publishedAt',
+      pageSize: 15
+    }
+  });
+  news = data.articles || [];
+  cache.set(cacheKey, news, 600);
+  return news;
+}
+
+module.exports = { fetchFootballNews, fetchAlAhlyNews };
+EOF
+
+# liveUpdatesService.js (مُصحَّح مع حماية writable)
+cat > yalla-kora/backend/services/liveUpdatesService.js << 'EOF'
+const logger = require('../utils/logger');
+
+class LiveUpdatesService {
+  constructor() {
+    if (!LiveUpdatesService.instance) {
+      this.clients = [];
+      LiveUpdatesService.instance = this;
+    }
+    return LiveUpdatesService.instance;
+  }
+
+  addClient(res) {
+    const client = { id: Date.now(), res };
+    this.clients.push(client);
+    logger.info(`SSE client connected. Total: ${this.clients.length}`);
+    return client;
+  }
+
+  removeClient(clientId) {
+    this.clients = this.clients.filter(c => c.id !== clientId);
+    logger.info(`SSE client disconnected. Total: ${this.clients.length}`);
+  }
+
+  broadcast(event, data) {
+    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    this.clients = this.clients.filter(client => {
+      // فحص أن الاتصال ما زال مفتوحاً
+      if (client.res.writableEnded || client.res.destroyed) {
+        return false;
+      }
+      try {
+        client.res.write(message);
+        return true;
+      } catch (e) {
+        logger.error(`SSE write error: ${e.message}`);
+        return false;
+      }
+    });
+  }
+}
+
+module.exports = new LiveUpdatesService();
+EOF
+
+# ============ API ROUTES ============
+# football.js
+cat > yalla-kora/backend/api/football.js << 'EOF'
+const router = require('express').Router();
+const service = require('../services/footballService');
+const validateParams = require('../middleware/validation');
+
+// اليوم والمباشر: يرجعان مصفوفة فقط (لا pagination)
+router.get('/matches/today', async (req, res) => {
+  try {
+    const data = await service.fetchTodayMatches();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب مباريات اليوم' });
+  }
+});
+
+router.get('/matches/live', async (req, res) => {
+  try {
+    const data = await service.fetchLiveMatches();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب المباريات المباشرة' });
+  }
+});
+
+// القادمة والمنتهية: مع pagination
+router.get('/matches/upcoming', validateParams(['page', 'limit']), async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const result = await service.fetchUpcomingMatches({ page: +page, limit: +limit });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب المباريات القادمة' });
+  }
+});
+
+router.get('/matches/finished', validateParams(['page', 'limit']), async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const result = await service.fetchFinishedMatches({ page: +page, limit: +limit });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب المباريات المنتهية' });
+  }
+});
+
+router.get('/standings/:leagueId', async (req, res) => {
+  try {
+    const data = await service.fetchStandings(req.params.leagueId, req.query.season);
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب جدول الترتيب' });
+  }
+});
+
+router.get('/team/:teamId', async (req, res) => {
+  try {
+    const data = await service.fetchTeam(req.params.teamId);
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب بيانات الفريق' });
+  }
+});
+
+router.get('/leagues', async (req, res) => {
+  try {
+    const data = await service.fetchLeagues();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب البطولات' });
+  }
+});
+
+module.exports = router;
+EOF
+
+# news.js
+cat > yalla-kora/backend/api/news.js << 'EOF'
+const router = require('express').Router();
+const service = require('../services/newsService');
+
+router.get('/football', async (req, res) => {
+  try {
+    const data = await service.fetchFootballNews();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب الأخبار الرياضية' });
+  }
+});
+
+router.get('/al-ahly', async (req, res) => {
+  try {
+    const data = await service.fetchAlAhlyNews();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر جلب أخبار الأهلي' });
+  }
+});
+
+module.exports = router;
+EOF
+
+# search.js
+cat > yalla-kora/backend/api/search.js << 'EOF'
+const router = require('express').Router();
+const service = require('../services/footballService');
+const validateParams = require('../middleware/validation');
+
+router.get('/', validateParams(['q', 'type']), async (req, res) => {
+  try {
+    const { q, type = 'team' } = req.query;
+    if (!q) return res.status(400).json({ error: 'الكلمة المفتاحية مطلوبة' });
+
+    let result;
+    if (type === 'team') {
+      result = await service.searchTeams(q);
+    } else if (type === 'league') {
+      result = await service.searchLeagues(q);
+    } else if (type === 'fixture') {
+      result = await service.searchFixtures(q);
+    } else {
+      return res.status(400).json({ error: 'نوع بحث غير صحيح' });
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: 'تعذر تنفيذ البحث' });
+  }
+});
+
+module.exports = router;
+EOF
+
+# sse.js
+cat > yalla-kora/backend/api/sse.js << 'EOF'
+const router = require('express').Router();
+const liveUpdates = require('../services/liveUpdatesService');
+
+router.get('/live-updates', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+
+  res.write('data: {"connected": true}\n\n');
+  const client = liveUpdates.addClient(res);
+
+  req.on('close', () => {
+    liveUpdates.removeClient(client.id);
+  });
+});
+
+module.exports = router;
+EOF
+
+# ============ MAIN SERVER ============
+cat > yalla-kora/backend/index.js << 'EOF'
+require('dotenv').config();
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const securityMiddleware = require('./middleware/security');
+const footballRouter = require('./api/football');
+const newsRouter = require('./api/news');
+const searchRouter = require('./api/search');
+const sseRouter = require('./api/sse');
+const logger = require('./utils/logger');
+
+// تحذيرات بدلاً من إيقاف السيرفر
+if (!process.env.FOOTBALL_API_KEY) {
+  logger.warn('⚠️ FOOTBALL_API_KEY غير موجودة - بعض الخدمات قد لا تعمل');
+}
+if (!process.env.NEWS_API_KEY) {
+  logger.warn('⚠️ NEWS_API_KEY غير موجودة - خدمة الأخبار معطلة');
+}
+
+const app = express();
+
+// الأمان
+app.use(securityMiddleware);
+app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // دقيقة
+  max: 100,            // 100 طلب في الدقيقة كحد أقصى
+  message: { error: 'تم تجاوز الحد الأقصى للطلبات. حاول مرة أخرى لاحقاً.' }
+});
+app.use('/api', limiter);
+
+// Routes
+app.use('/api/football', footballRouter);
+app.use('/api/news', newsRouter);
+app.use('/api/search', searchRouter);
+app.use('/api/sse', sseRouter);
+
+// Error handling
+app.use((err, req, res, next) => {
+  logger.error(err.stack);
+  res.status(500).json({ error: 'حدث خطأ داخلي في الخادم' });
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  logger.info(`✅ Yalla Kora V4 backend running on port ${PORT}`);
+});
+
+module.exports = app;
+EOF
+
+# ==============================================
+# FRONTEND
+# ==============================================
+
+# package.json
+cat > yalla-kora/frontend/package.json << 'EOF'
+{
+  "name": "yalla-kora-frontend",
+  "private": true,
+  "version": "4.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.8.0",
+    "axios": "^1.6.0",
+    "date-fns": "^2.30.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-icons": "^4.12.0",
+    "react-router-dom": "^6.20.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.0",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.3.6",
+    "tailwindcss-rtl": "^0.9.0",
+    "vite": "^5.0.0",
+    "vite-plugin-pwa": "^0.17.0"
+  }
+}
+EOF
+
+# .env.example
+cat > yalla-kora/frontend/.env.example << 'EOF'
+VITE_API_PROXY_URL=http://localhost:3001/api
+EOF
+
+# index.html
+cat > yalla-kora/frontend/index.html << 'EOF'
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet" />
+  <meta name="theme-color" content="#047857" />
+  <title>Yalla Kora | يلا كورة</title>
+</head>
+<body class="bg-gray-50 dark:bg-gray-900">
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
+EOF
+
+# vite.config.js
+cat > yalla-kora/frontend/vite.config.js << 'EOF'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { VitePWA } from 'vite-plugin-pwa';
+
+export default defineConfig({
+  plugins: [
+    react(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      manifest: {
+        name: 'Yalla Kora',
+        short_name: 'Yalla Kora',
+        description: 'يلا كورة - موقع كرة قدم عربي احترافي',
+        theme_color: '#047857',
+        background_color: '#ffffff',
+        display: 'standalone',
+        start_url: '/',
+        icons: [
+          { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }
+        ]
+      },
+      workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+        runtimeCaching: [
+          {
+            urlPattern: /^https?:\/\/.*\/api\/.*/i,
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'api-cache',
+              expiration: { maxEntries: 100, maxAgeSeconds: 300 }
+            }
+          }
+        ]
+      }
+    })
+  ],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: { vendor: ['react', 'react-dom', 'react-router-dom'] }
+      }
+    }
+  }
+});
+EOF
+
+# tailwind.config.js
+cat > yalla-kora/frontend/tailwind.config.js << 'EOF'
+import rtl from 'tailwindcss-rtl';
+
+export default {
+  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  darkMode: 'class',
+  theme: {
+    extend: {
+      fontFamily: {
+        arabic: ['Cairo', 'sans-serif']
+      }
+    }
+  },
+  plugins: [rtl]
+};
+EOF
+
+# postcss.config.js
+cat > yalla-kora/frontend/postcss.config.js << 'EOF'
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {}
+  }
+};
+EOF
+
+# styles/index.css
+cat > yalla-kora/frontend/src/styles/index.css << 'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Cairo', sans-serif;
+  }
+  body {
+    @apply bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100 transition-colors;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-white dark:bg-gray-800 rounded-xl shadow-md p-4 transition hover:shadow-lg;
+  }
+  .btn-primary {
+    @apply bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2 px-6 rounded-lg transition;
+  }
+}
+EOF
+
+# main.jsx
+cat > yalla-kora/frontend/src/main.jsx << 'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import App from './App';
+import { FavoritesProvider } from './context/FavoritesContext';
+import { SettingsProvider } from './context/SettingsContext';
+import './styles/index.css';
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      retry: 1,
+      staleTime: 2 * 60 * 1000, // 2 minutes
+    }
+  }
+});
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <SettingsProvider>
+          <FavoritesProvider>
+            <App />
+          </FavoritesProvider>
+        </SettingsProvider>
+      </BrowserRouter>
+    </QueryClientProvider>
+  </React.StrictMode>
+);
+EOF
+
+# App.jsx مع ErrorBoundary
+cat > yalla-kora/frontend/src/App.jsx << 'EOF'
+import { lazy, Suspense } from 'react';
+import { Routes, Route } from 'react-router-dom';
+import Layout from './components/Layout';
+import ErrorBoundary from './components/ErrorBoundary';
+import SkeletonLoader from './components/SkeletonLoader';
+
+const Home = lazy(() => import('./pages/Home'));
+const Matches = lazy(() => import('./pages/Matches'));
+const Leagues = lazy(() => import('./pages/Leagues'));
+const Standings = lazy(() => import('./pages/Standings'));
+const TeamPage = lazy(() => import('./pages/TeamPage'));
+const News = lazy(() => import('./pages/News'));
+const Search = lazy(() => import('./pages/Search'));
+const Favorites = lazy(() => import('./pages/Favorites'));
+const AlAhly = lazy(() => import('./pages/AlAhly'));
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <div dir="rtl" className="font-arabic min-h-screen bg-gray-50 dark:bg-gray-900">
+        <Suspense fallback={<SkeletonLoader count={6} />}>
+          <Routes>
+            <Route element={<Layout />}>
+              <Route path="/" element={<Home />} />
+              <Route path="/matches" element={<Matches />} />
+              <Route path="/leagues" element={<Leagues />} />
+              <Route path="/standings/:leagueId" element={<Standings />} />
+              <Route path="/team/:teamId" element={<TeamPage />} />
+              <Route path="/news" element={<News />} />
+              <Route path="/search" element={<Search />} />
+              <Route path="/favorites" element={<Favorites />} />
+              <Route path="/al-ahly" element={<AlAhly />} />
+            </Route>
+          </Routes>
+        </Suspense>
+      </div>
+    </ErrorBoundary>
+  );
+}
+EOF
+
+# ============ CONTEXTS ============
+# FavoritesContext.jsx
+cat > yalla-kora/frontend/src/context/FavoritesContext.jsx << 'EOF'
+import { createContext, useContext } from 'react';
+import useLocalStorage from '../hooks/useLocalStorage';
+
+const FavoritesContext = createContext();
+
+export function FavoritesProvider({ children }) {
+  const [favorites, setFavorites] = useLocalStorage('yalla_kora_favorites', {
+    teams: [],
+    leagues: [],
+    matches: []
+  });
+
+  const add = (type, id) => {
+    setFavorites(prev => ({
+      ...prev,
+      [type]: [...new Set([...prev[type], id])]
+    }));
+  };
+
+  const remove = (type, id) => {
+    setFavorites(prev => ({
+      ...prev,
+      [type]: prev[type].filter(item => item !== id)
+    }));
+  };
+
+  const isFav = (type, id) => favorites[type].includes(id);
+
+  return (
+    <FavoritesContext.Provider value={{ favorites, add, remove, isFav }}>
+      {children}
+    </FavoritesContext.Provider>
+  );
+}
+
+export const useFavorites = () => useContext(FavoritesContext);
+EOF
+
+# SettingsContext.jsx
+cat > yalla-kora/frontend/src/context/SettingsContext.jsx << 'EOF'
+import { createContext, useContext, useEffect } from 'react';
+import useLocalStorage from '../hooks/useLocalStorage';
+
+const SettingsContext = createContext();
+
+export function SettingsProvider({ children }) {
+  const [darkMode, setDarkMode] = useLocalStorage('yalla_kora_dark_mode', false);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', darkMode);
+  }, [darkMode]);
+
+  const toggleDarkMode = () => setDarkMode(prev => !prev);
+
+  return (
+    <SettingsContext.Provider value={{ darkMode, toggleDarkMode }}>
+      {children}
+    </SettingsContext.Provider>
+  );
+}
+
+export const useSettings = () => useContext(SettingsContext);
+EOF
+
+# ============ HOOKS ============
+cat > yalla-kora/frontend/src/hooks/useLocalStorage.js << 'EOF'
+import { useState, useEffect } from 'react';
+
+export default function useLocalStorage(key, initialValue) {
+  const [storedValue, setStoredValue] = useState(() => {
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch (error) {
+      console.error('LocalStorage read error:', error);
+      return initialValue;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(key, JSON.stringify(storedValue));
+    } catch (error) {
+      console.error('LocalStorage write error:', error);
+    }
+  }, [key, storedValue]);
+
+  return [storedValue, setStoredValue];
+}
+EOF
+
+# ============ UTILS ============
+cat > yalla-kora/frontend/src/utils/helpers.js << 'EOF'
+export function formatDate(dateString) {
+  return new Date(dateString).toLocaleDateString('ar-EG', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  });
+}
+
+export function getMatchStatus(fixture) {
+  if (!fixture?.status) return 'upcoming';
+  const short = fixture.status;
+  if (['LIVE', '1H', '2H', 'HT'].includes(short)) return 'live';
+  if (['FT', 'AET', 'PEN'].includes(short)) return 'finished';
+  return 'upcoming';
+}
+EOF
+
+# ============ COMPONENTS ============
+# ErrorBoundary.jsx
+cat > yalla-kora/frontend/src/components/ErrorBoundary.jsx << 'EOF'
+import { Component } from 'react';
+
+export default class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, info) {
+    console.error('ErrorBoundary caught an error:', error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center">
+          <div className="card text-center">
+            <h1 className="text-2xl font-bold mb-2">عذراً، حدث خطأ غير متوقع</h1>
+            <p className="text-gray-500">يرجى تحديث الصفحة أو المحاولة لاحقاً</p>
+            <button
+              onClick={() => window.location.reload()}
+              className="btn-primary mt-4"
+            >
+              تحديث الصفحة
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+EOF
+
+# Layout.jsx (مُحسَّن)
+cat > yalla-kora/frontend/src/components/Layout.jsx << 'EOF'
+import { Outlet, Link, NavLink } from 'react-router-dom';
+import { useSettings } from '../context/SettingsContext';
+import { HiHome, HiCalendar, HiNewspaper, HiSearch, HiStar, HiMoon, HiSun } from 'react-icons/hi';
+
+export default function Layout() {
+  const { darkMode, toggleDarkMode } = useSettings();
+
+  return (
+    <div className="flex flex-col min-h-screen">
+      {/* Header */}
+      <header className="bg-emerald-700 text-white shadow-lg sticky top-0 z-50">
+        <div className="container mx-auto px-4 py-3 flex justify-between items-center">
+          <Link to="/" className="text-2xl font-bold">Yalla Kora</Link>
+          <nav className="hidden md:flex gap-6">
+            <NavLink to="/" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>الرئيسية</NavLink>
+            <NavLink to="/matches" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>المباريات</NavLink>
+            <NavLink to="/leagues" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>البطولات</NavLink>
+            <NavLink to="/news" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>الأخبار</NavLink>
+            <NavLink to="/search" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>بحث</NavLink>
+            <NavLink to="/favorites" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>المفضلة</NavLink>
+            <NavLink to="/al-ahly" className={({ isActive }) => isActive ? 'text-yellow-300' : 'hover:text-emerald-200'}>الأهلي</NavLink>
+          </nav>
+          <button onClick={toggleDarkMode} className="p-2 rounded-full hover:bg-emerald-600">
+            {darkMode ? <HiSun size={22} /> : <HiMoon size={22} />}
+          </button>
+        </div>
+        {/* Mobile bottom nav */}
+        <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-emerald-800 text-white flex justify-around py-2 z-50">
+          <NavLink to="/" className="flex flex-col items-center text-xs"><HiHome size={20} /><span>الرئيسية</span></NavLink>
+          <NavLink to="/matches" className="flex flex-col items-center text-xs"><HiCalendar size={20} /><span>مباريات</span></NavLink>
+          <NavLink to="/news" className="flex flex-col items-center text-xs"><HiNewspaper size={20} /><span>أخبار</span></NavLink>
+          <NavLink to="/favorites" className="flex flex-col items-center text-xs"><HiStar size={20} /><span>مفضلة</span></NavLink>
+        </nav>
+      </header>
+
+      <main className="flex-grow container mx-auto px-4 py-6 pb-20 md:pb-6">
+        <Outlet />
+      </main>
+
+      <footer className="bg-gray-200 dark:bg-gray-800 text-center py-4 text-sm hidden md:block">
+        جميع البيانات من مصادر حقيقية – Yalla Kora
+      </footer>
+    </div>
+  );
+}
+EOF
+
+# ErrorMessage.jsx
+cat > yalla-kora/frontend/src/components/ErrorMessage.jsx << 'EOF'
+export default function ErrorMessage({ message = 'حدث خطأ ما' }) {
+  return (
+    <div className="card border border-red-300 dark:border-red-700 text-center py-8">
+      <p className="text-red-600 dark:text-red-400 font-semibold text-lg">⚠️ {message}</p>
+      <p className="text-gray-500 mt-2">برجاء المحاولة مرة أخرى لاحقاً</p>
+    </div>
+  );
+}
+EOF
+
+# EmptyState.jsx
+cat > yalla-kora/frontend/src/components/EmptyState.jsx << 'EOF'
+import { HiOutlineInbox } from 'react-icons/hi';
+
+export default function EmptyState({ message = 'لا توجد بيانات' }) {
+  return (
+    <div className="card text-center py-12 text-gray-500 dark:text-gray-400">
+      <HiOutlineInbox className="mx-auto text-5xl mb-3 text-gray-300 dark:text-gray-600" />
+      <p className="text-lg">{message}</p>
+    </div>
+  );
+}
+EOF
+
+# SkeletonLoader.jsx (مُحسَّن)
+cat > yalla-kora/frontend/src/components/SkeletonLoader.jsx << 'EOF'
+export function MatchCardSkeleton() {
+  return (
+    <div className="card animate-pulse flex justify-between items-center">
+      <div className="flex items-center gap-4">
+        <div className="w-10 h-10 bg-gray-300 dark:bg-gray-600 rounded-full"></div>
+        <div className="space-y-2">
+          <div className="h-4 bg-gray-300 dark:bg-gray-600 w-20"></div>
+          <div className="h-6 bg-gray-300 dark:bg-gray-600 w-10"></div>
+        </div>
+      </div>
+      <div className="space-y-1">
+        <div className="h-4 bg-gray-300 dark:bg-gray-600 w-12 mx-auto"></div>
+        <div className="h-4 bg-gray-300 dark:bg-gray-600 w-12 mx-auto"></div>
+      </div>
+      <div className="flex items-center gap-4">
+        <div className="space-y-2">
+          <div className="h-4 bg-gray-300 dark:bg-gray-600 w-20"></div>
+          <div className="h-6 bg-gray-300 dark:bg-gray-600 w-10"></div>
+        </div>
+        <div className="w-10 h-10 bg-gray-300 dark:bg-gray-600 rounded-full"></div>
+      </div>
+    </div>
+  );
+}
+
+export default function SkeletonLoader({ count = 3 }) {
+  return (
+    <div className="space-y-4">
+      {Array.from({ length: count }).map((_, i) => (
+        <MatchCardSkeleton key={i} />
+      ))}
+    </div>
+  );
+}
+EOF
+
+# MatchCard.jsx (مع memo)
+cat > yalla-kora/frontend/src/components/MatchCard.jsx << 'EOF'
+import { memo } from 'react';
+import { Link } from 'react-router-dom';
+import { useFavorites } from '../context/FavoritesContext';
+import { getMatchStatus } from '../utils/helpers';
+import { HiStar, HiOutlineStar } from 'react-icons/hi';
+
+const MatchCard = ({ fixture }) => {
+  const { isFav, add, remove } = useFavorites();
+  const fav = isFav('matches', fixture.id);
+  const status = getMatchStatus(fixture);
+
+  if (!fixture || !fixture.homeTeam || !fixture.awayTeam) return null;
+
+  return (
+    <div className={`card flex justify-between items-center ${status === 'live' ? 'border-l-4 border-red-500' : ''}`}>
+      <div className="flex items-center gap-4">
+        <img src={fixture.homeTeam.logo} alt={fixture.homeTeam.name} className="w-10 h-10 object-contain" />
+        <div>
+          <p className="font-bold text-lg">{fixture.homeTeam.name}</p>
+          {fixture.goals?.home != null && <span className="text-2xl font-mono">{fixture.goals.home}</span>}
+        </div>
+      </div>
+
+      <div className="text-center">
+        <p className="text-sm text-gray-500 dark:text-gray-400">
+          {status === 'live' ? '🔴 مباشر' :
+           status === 'finished' ? '⏹ انتهت' :
+           new Date(fixture.date).toLocaleTimeString('ar', { hour: '2-digit', minute: '2-digit' })}
+        </p>
+        <Link to={`/team/${fixture.homeTeam.id}`} className="text-emerald-600 text-xs mt-1 block">تفاصيل</Link>
+      </div>
+
+      <div className="flex items-center gap-4">
+        <div>
+          <p className="font-bold text-lg">{fixture.awayTeam.name}</p>
+          {fixture.goals?.away != null && <span className="text-2xl font-mono">{fixture.goals.away}</span>}
+        </div>
+        <img src={fixture.awayTeam.logo} alt={fixture.awayTeam.name} className="w-10 h-10 object-contain" />
+      </div>
+
+      <button
+        onClick={() => fav ? remove('matches', fixture.id) : add('matches', fixture.id)}
+        className="p-1"
+        aria-label={fav ? 'إزالة من المفضلة' : 'إضافة إلى المفضلة'}
+      >
+        {fav ? <HiStar className="text-yellow-500" size={20} /> : <HiOutlineStar size={20} />}
+      </button>
+    </div>
+  );
+};
+
+export default memo(MatchCard);
+EOF
+
+# InfiniteScroll.jsx
+cat > yalla-kora/frontend/src/components/InfiniteScroll.jsx << 'EOF'
+import { useEffect, useRef } from 'react';
+
+export default function InfiniteScroll({ loadMore, hasMore, loading }) {
+  const loaderRef = useRef(null);
+
+  useEffect(() => {
+    if (!hasMore || loading) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) loadMore();
+      },
+      { threshold: 0.1 }
+    );
+    if (loaderRef.current) observer.observe(loaderRef.current);
+    return () => observer.disconnect();
+  }, [loadMore, hasMore, loading]);
+
+  return (
+    <div ref={loaderRef} className="py-4 text-center text-gray-500">
+      {loading ? 'جاري التحميل...' : hasMore ? 'اسحب للمزيد' : 'لا مزيد من النتائج'}
+    </div>
+  );
+}
+EOF
+
+# Pagination.jsx
+cat > yalla-kora/frontend/src/components/Pagination.jsx << 'EOF'
+export default function Pagination({ current, total, onPageChange }) {
+  if (total <= 1) return null;
+  return (
+    <div className="flex justify-center gap-2 mt-4">
+      {Array.from({ length: total }, (_, i) => i + 1).map(page => (
+        <button
+          key={page}
+          onClick={() => onPageChange(page)}
+          disabled={page === current}
+          className={`px-3 py-1 rounded ${page === current ? 'bg-emerald-700 text-white' : 'bg-gray-200 dark:bg-gray-700'}`}
+        >
+          {page}
+        </button>
+      ))}
+    </div>
+  );
+}
+EOF
+
+# ============ API ============
+cat > yalla-kora/frontend/src/api/footballApi.js << 'EOF'
+import axios from 'axios';
+
+const PROXY = import.meta.env.VITE_API_PROXY_URL + '/football';
+
+export const getTodayMatches = () => axios.get(`${PROXY}/matches/today`).then(r => r.data);
+export const getLiveMatches = () => axios.get(`${PROXY}/matches/live`).then(r => r.data);
+export const getUpcomingMatches = (page = 1, limit = 10) =>
+  axios.get(`${PROXY}/matches/upcoming`, { params: { page, limit } }).then(r => r.data);
+export const getFinishedMatches = (page = 1, limit = 10) =>
+  axios.get(`${PROXY}/matches/finished`, { params: { page, limit } }).then(r => r.data);
+export const getStandings = (leagueId, season) =>
+  axios.get(`${PROXY}/standings/${leagueId}`, { params: { season } }).then(r => r.data);
+export const getTeamInfo = (teamId) => axios.get(`${PROXY}/team/${teamId}`).then(r => r.data);
+export const getLeagues = () => axios.get(`${PROXY}/leagues`).then(r => r.data);
+EOF
+
+cat > yalla-kora/frontend/src/api/newsApi.js << 'EOF'
+import axios from 'axios';
+
+const PROXY = import.meta.env.VITE_API_PROXY_URL + '/news';
+
+export const getFootballNews = () => axios.get(`${PROXY}/football`).then(r => r.data);
+export const getAlAhlyNews = () => axios.get(`${PROXY}/al-ahly`).then(r => r.data);
+EOF
+
+# ============ PAGES ============
+# Home.jsx
+cat > yalla-kora/frontend/src/pages/Home.jsx << 'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { getTodayMatches, getLiveMatches } from '../api/footballApi';
+import { getFootballNews } from '../api/newsApi';
+import { Link } from 'react-router-dom';
+import MatchCard from '../components/MatchCard';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+export default function Home() {
+  const todayMatches = useQuery({ queryKey: ['todayMatches'], queryFn: getTodayMatches });
+  const liveMatches = useQuery({ queryKey: ['liveMatches'], queryFn: getLiveMatches });
+  const news = useQuery({ queryKey: ['footballNews'], queryFn: getFootballNews });
+
+  return (
+    <div className="space-y-8">
+      <h1 className="text-3xl font-bold">أهلاً بك في Yalla Kora</h1>
+
+      {/* مباشر */}
+      <section>
+        <h2 className="text-2xl font-semibold mb-4">🔴 المباريات المباشرة</h2>
+        {liveMatches.isLoading ? <SkeletonLoader /> :
+         liveMatches.isError ? <ErrorMessage message="تعذر جلب المباريات المباشرة" /> :
+         liveMatches.data?.length === 0 ? <EmptyState message="لا توجد مباريات مباشرة حالياً" /> :
+         liveMatches.data.map(fixture => <MatchCard key={fixture.id} fixture={fixture} />)}
+      </section>
+
+      {/* اليوم */}
+      <section>
+        <h2 className="text-2xl font-semibold mb-4">📅 مباريات اليوم</h2>
+        {todayMatches.isLoading ? <SkeletonLoader /> :
+         todayMatches.isError ? <ErrorMessage message="تعذر جلب مباريات اليوم" /> :
+         todayMatches.data?.length === 0 ? <EmptyState message="لا توجد مباريات اليوم" /> :
+         todayMatches.data.map(fixture => <MatchCard key={fixture.id} fixture={fixture} />)}
+      </section>
+
+      {/* أخبار */}
+      <section>
+        <h2 className="text-2xl font-semibold mb-4">📰 أخبار كرة القدم</h2>
+        {news.isLoading ? <SkeletonLoader count={2} /> :
+         news.isError ? <ErrorMessage message="تعذر جلب الأخبار" /> :
+         news.data?.length === 0 ? <EmptyState message="لا توجد أخبار حالياً" /> :
+         <div className="grid md:grid-cols-2 gap-4">
+           {news.data.slice(0, 6).map((article, i) => (
+             <a key={i} href={article.url} target="_blank" rel="noopener noreferrer" className="card block hover:shadow-lg transition">
+               {article.urlToImage && <img src={article.urlToImage} alt="" className="w-full h-40 object-cover rounded mb-2" />}
+               <h3 className="font-bold">{article.title}</h3>
+               <p className="text-sm text-gray-500 mt-1">{article.source.name}</p>
+             </a>
+           ))}
+         </div>}
+        <Link to="/news" className="btn-primary inline-block mt-4">كل الأخبار</Link>
+      </section>
+    </div>
+  );
+}
+EOF
+
+# Matches.jsx (مصححة مع توحيد flatMap)
+cat > yalla-kora/frontend/src/pages/Matches.jsx << 'EOF'
+import { useState } from 'react';
+import { useInfiniteQuery } from '@tanstack/react-query';
+import axios from 'axios';
+import MatchCard from '../components/MatchCard';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+import InfiniteScroll from '../components/InfiniteScroll';
+
+const PROXY = import.meta.env.VITE_API_PROXY_URL + '/football';
+
+export default function Matches() {
+  const [tab, setTab] = useState('live');
+
+  const fetchMatches = async ({ pageParam = 1 }) => {
+    let endpoint;
+    if (tab === 'live') endpoint = '/matches/live';
+    else if (tab === 'today') endpoint = '/matches/today';
+    else if (tab === 'upcoming') endpoint = '/matches/upcoming';
+    else if (tab === 'finished') endpoint = '/matches/finished';
+
+    const params = (tab === 'live' || tab === 'today') ? {} : { page: pageParam, limit: 10 };
+    const { data } = await axios.get(`${PROXY}${endpoint}`, { params });
+
+    // live/today يرجعالن مصفوفة مباشرة، نغلفها لتوحيد الاستخراج
+    if (tab === 'live' || tab === 'today') {
+      return { data }; // سيكون لدينا page.data
+    }
+    return data; // already { data, pagination }
+  };
+
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+    isError
+  } = useInfiniteQuery({
+    queryKey: ['matches', tab],
+    queryFn: fetchMatches,
+    getNextPageParam: (lastPage) => {
+      if (tab === 'live' || tab === 'today') return undefined;
+      const pagination = lastPage?.pagination;
+      if (pagination && pagination.page < pagination.totalPages) {
+        return pagination.page + 1;
+      }
+      return undefined;
+    },
+    staleTime: 60 * 1000,
+  });
+
+  // استخراج المصفوفات بشكل آمن
+  const matches = data?.pages.flatMap(page => {
+    // page قد يكون { data: [...] } (من live/today) أو { data, pagination } (من upcoming/finished)
+    const arr = page?.data ?? page;
+    return Array.isArray(arr) ? arr : [];
+  }) ?? [];
+
+  return (
+    <div>
+      <div className="flex gap-2 mb-4 flex-wrap">
+        {['live','today','upcoming','finished'].map(t => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`px-4 py-2 rounded ${tab === t ? 'bg-emerald-700 text-white' : 'bg-gray-200 dark:bg-gray-700'}`}
+          >
+            {t === 'live' ? 'مباشر' : t === 'today' ? 'اليوم' : t === 'upcoming' ? 'قادمة' : 'انتهت'}
+          </button>
+        ))}
+      </div>
+
+      {isLoading ? <SkeletonLoader /> :
+       isError ? <ErrorMessage /> :
+       matches.length === 0 ? <EmptyState message="لا توجد مباريات" /> :
+       <>
+         {matches.map(fixture => <MatchCard key={fixture.id} fixture={fixture} />)}
+         <InfiniteScroll loadMore={fetchNextPage} hasMore={!!hasNextPage} loading={isFetchingNextPage} />
+       </>}
+    </div>
+  );
+}
+EOF
+
+# Leagues.jsx
+cat > yalla-kora/frontend/src/pages/Leagues.jsx << 'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { getLeagues } from '../api/footballApi';
+import { Link } from 'react-router-dom';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+export default function Leagues() {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['leagues'],
+    queryFn: getLeagues,
+    staleTime: 3600 * 1000
+  });
+
+  if (isLoading) return <SkeletonLoader count={6} />;
+  if (isError) return <ErrorMessage />;
+  if (!data?.length) return <EmptyState message="لا بطولات متاحة" />;
+
+  return (
+    <div className="grid md:grid-cols-3 gap-4">
+      {data.map(league => (
+        <Link
+          key={league.id}
+          to={`/standings/${league.id}`}
+          className="card flex items-center gap-4 hover:shadow-lg transition"
+        >
+          <img src={league.logo} alt={league.name} className="w-12 h-12 object-contain" />
+          <span className="font-bold">{league.name}</span>
+        </Link>
+      ))}
+    </div>
+  );
+}
+EOF
+
+# Standings.jsx (مُحسَّن للجوال)
+cat > yalla-kora/frontend/src/pages/Standings.jsx << 'EOF'
+import { useParams } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
+import { getStandings } from '../api/footballApi';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+export default function Standings() {
+  const { leagueId } = useParams();
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['standings', leagueId],
+    queryFn: () => getStandings(leagueId)
+  });
+
+  if (isLoading) return <SkeletonLoader count={5} />;
+  if (isError) return <ErrorMessage />;
+  if (!data?.length) return <EmptyState message="لا تتوفر بيانات الترتيب" />;
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full card text-sm">
+        <thead>
+          <tr>
+            <th className="py-2 px-1">#</th>
+            <th className="text-right">الفريق</th>
+            <th className="px-1">لعب</th>
+            <th className="px-1">نقاط</th>
+            <th className="hidden sm:table-cell px-1">فارق</th>
+            <th className="hidden sm:table-cell px-1">آخر 5</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.map(team => (
+            <tr key={team.team.id} className="border-t dark:border-gray-700">
+              <td className="py-2 px-1">{team.rank}</td>
+              <td className="flex items-center gap-2 py-2">
+                <img src={team.team.logo} className="w-6 h-6" />
+                <span className="truncate max-w-[120px]">{team.team.name}</span>
+              </td>
+              <td className="px-1">{team.played}</td>
+              <td className="px-1 font-bold">{team.points}</td>
+              <td className="hidden sm:table-cell px-1">{team.goalsDiff}</td>
+              <td className="hidden sm:table-cell px-1 text-xs">{team.form}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+EOF
+
+# TeamPage.jsx
+cat > yalla-kora/frontend/src/pages/TeamPage.jsx << 'EOF'
+import { useParams } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
+import { getTeamInfo } from '../api/footballApi';
+import MatchCard from '../components/MatchCard';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+export default function TeamPage() {
+  const { teamId } = useParams();
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['team', teamId],
+    queryFn: () => getTeamInfo(teamId)
+  });
+
+  if (isLoading) return <SkeletonLoader count={4} />;
+  if (isError) return <ErrorMessage />;
+  if (!data?.team) return <EmptyState message="لا توجد بيانات للفريق" />;
+
+  return (
+    <div className="space-y-6">
+      <div className="card flex items-center gap-4">
+        <img src={data.team.logo} alt={data.team.name} className="w-20 h-20" />
+        <h1 className="text-3xl font-bold">{data.team.name}</h1>
+      </div>
+
+      <h2 className="text-2xl font-bold">آخر المباريات</h2>
+      {data.recentFixtures.length === 0 ? <EmptyState message="لا مباريات سابقة" /> :
+        data.recentFixtures.map(f => <MatchCard key={f.id} fixture={f} />)
+      }
+    </div>
+  );
+}
+EOF
+
+# News.jsx
+cat > yalla-kora/frontend/src/pages/News.jsx << 'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { getFootballNews } from '../api/newsApi';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+export default function News() {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['footballNews'],
+    queryFn: getFootballNews
+  });
+
+  if (isLoading) return <SkeletonLoader count={4} />;
+  if (isError) return <ErrorMessage />;
+  if (!data?.length) return <EmptyState message="لا توجد أخبار" />;
+
+  return (
+    <div className="grid md:grid-cols-2 gap-4">
+      {data.map((article, i) => (
+        <a key={i} href={article.url} target="_blank" rel="noopener noreferrer" className="card block hover:shadow-lg transition">
+          {article.urlToImage && <img src={article.urlToImage} alt="" className="w-full h-40 object-cover rounded mb-2" />}
+          <h3 className="font-bold">{article.title}</h3>
+          <p className="text-sm text-gray-500 mt-1">{article.source.name}</p>
+        </a>
+      ))}
+    </div>
+  );
+}
+EOF
+
+# Search.jsx (بحث فعلي)
+cat > yalla-kora/frontend/src/pages/Search.jsx << 'EOF'
+import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import axios from 'axios';
+import { Link } from 'react-router-dom';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+const PROXY = import.meta.env.VITE_API_PROXY_URL;
+
+export default function Search() {
+  const [query, setQuery] = useState('');
+  const [type, setType] = useState('team');
+  const [submittedQuery, setSubmittedQuery] = useState('');
+
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['search', submittedQuery, type],
+    queryFn: () =>
+      axios.get(`${PROXY}/search`, { params: { q: submittedQuery, type } }).then(r => r.data),
+    enabled: false, // لا يُشغّل تلقائياً
+  });
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+    setSubmittedQuery(query.trim());
+    refetch();
+  };
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="card flex gap-2 mb-4">
+        <input
+          type="text"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          placeholder="ابحث عن فريق، بطولة، أو مباريات..."
+          className="flex-1 p-2 rounded border dark:bg-gray-700 dark:border-gray-600"
+        />
+        <select value={type} onChange={e => setType(e.target.value)} className="p-2 rounded border dark:bg-gray-700 dark:border-gray-600">
+          <option value="team">فرق</option>
+          <option value="league">بطولات</option>
+          <option value="fixture">مباريات</option>
+        </select>
+        <button type="submit" className="btn-primary">بحث</button>
+      </form>
+
+      {isLoading && <SkeletonLoader count={3} />}
+      {isError && <ErrorMessage message="فشل البحث" />}
+      {data && data.length === 0 && <EmptyState message="لا نتائج" />}
+
+      <div className="space-y-4">
+        {data?.map(item => (
+          <div key={item.id} className="card">
+            {type === 'team' && (
+              <Link to={`/team/${item.id}`} className="flex items-center gap-3">
+                {item.logo && <img src={item.logo} alt={item.name} className="w-8 h-8" />}
+                <span>{item.name}</span>
+              </Link>
+            )}
+            {type === 'league' && (
+              <Link to={`/standings/${item.id}`} className="flex items-center gap-3">
+                {item.logo && <img src={item.logo} alt={item.name} className="w-8 h-8" />}
+                <span>{item.name}</span>
+              </Link>
+            )}
+            {type === 'fixture' && (
+              <div>
+                <p className="font-bold">{item.homeTeam?.name} - {item.awayTeam?.name}</p>
+                <small className="text-gray-500">
+                  {new Date(item.date).toLocaleString('ar')}
+                  {item.goals?.home != null && ` (${item.goals.home} - ${item.goals.away})`}
+                </small>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+EOF
+
+# Favorites.jsx (عرض بسيط)
+cat > yalla-kora/frontend/src/pages/Favorites.jsx << 'EOF'
+import { useFavorites } from '../context/FavoritesContext';
+
+export default function Favorites() {
+  const { favorites } = useFavorites();
+
+  return (
+    <div className="space-y-4">
+      <h1 className="text-3xl font-bold">المفضلة</h1>
+      <div className="card">
+        <h2 className="font-semibold mb-2">الفرق</h2>
+        {favorites.teams.length ? favorites.teams.join(', ') : 'لا توجد فرق مفضلة'}
+      </div>
+      <div className="card">
+        <h2 className="font-semibold mb-2">البطولات</h2>
+        {favorites.leagues.length ? favorites.leagues.join(', ') : 'لا توجد بطولات مفضلة'}
+      </div>
+      <div className="card">
+        <h2 className="font-semibold mb-2">المباريات</h2>
+        {favorites.matches.length ? favorites.matches.join(', ') : 'لا توجد مباريات مفضلة'}
+      </div>
+    </div>
+  );
+}
+EOF
+
+# AlAhly.jsx
+cat > yalla-kora/frontend/src/pages/AlAhly.jsx << 'EOF'
+import { useQuery } from '@tanstack/react-query';
+import { getTeamInfo } from '../api/footballApi';
+import { getAlAhlyNews } from '../api/newsApi';
+import MatchCard from '../components/MatchCard';
+import ErrorMessage from '../components/ErrorMessage';
+import SkeletonLoader from '../components/SkeletonLoader';
+import EmptyState from '../components/EmptyState';
+
+const AHLY_TEAM_ID = 611;
+
+export default function AlAhly() {
+  const team = useQuery({ queryKey: ['team', AHLY_TEAM_ID], queryFn: () => getTeamInfo(AHLY_TEAM_ID) });
+  const news = useQuery({ queryKey: ['alAhlyNews'], queryFn: getAlAhlyNews });
+
+  if (team.isLoading) return <SkeletonLoader fullPage />;
+
+  return (
+    <div className="space-y-6">
+      <div className="card flex items-center gap-4 bg-red-700 text-white">
+        <img src={team.data?.team?.logo} alt="الأهلي" className="w-20 h-20" />
+        <h1 className="text-3xl font-bold">النادي الأهلي المصري</h1>
+      </div>
+
+      <section>
+        <h2 className="text-2xl font-bold mb-3">آخر المباريات</h2>
+        {team.isError ? <ErrorMessage /> :
+         team.data?.recentFixtures?.length ? team.data.recentFixtures.map(f => <MatchCard key={f.id} fixture={f} />) :
+         <EmptyState message="لا مباريات سابقة" />}
+      </section>
+
+      <section>
+        <h2 className="text-2xl font-bold mb-3">أخبار الأهلي</h2>
+        {news.isLoading ? <SkeletonLoader count={3} /> :
+         news.isError ? <ErrorMessage /> :
+         news.data?.length ? (
+           <div className="grid md:grid-cols-2 gap-4">
+             {news.data.map((article, i) => (
+               <a key={i} href={article.url} target="_blank" className="card block">
+                 <h3 className="font-bold">{article.title}</h3>
+                 <p className="text-sm text-gray-500">{article.source.name}</p>
+               </a>
+             ))}
+           </div>
+         ) : <EmptyState message="لا أخبار" />}
+      </section>
+    </div>
+  );
+}
+EOF
+
+# offline.html لـ PWA
+cat > yalla-kora/frontend/public/offline.html << 'EOF'
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>Yalla Kora - غير متصل</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="text-align:center;padding-top:50px;font-family:sans-serif;">
+  <h1>أنت غير متصل بالإنترنت</h1>
+  <p>يرجى التحقق من اتصالك ومحاولة تحديث الصفحة</p>
+</body>
+</html>
+EOF
+
+# إنشاء ملف robots.txt و sitemap.xml للـ SEO (اختياري)
+cat > yalla-kora/frontend/public/robots.txt << 'EOF'
+User-agent: *
+Allow: /
+EOF
+
+cat > yalla-kora/frontend/public/sitemap.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://yallakora.example.com/</loc></url>
+</urlset>
+EOF
+
+echo ""
+echo "✅ تم إنشاء مشروع Yalla Kora V4 بالكامل!"
+echo "📁 المجلد: yalla-kora"
+echo ""
+echo "الخطوات التالية:"
+echo "1. انتقل إلى مجلد backend:"
+echo "   cd yalla-kora/backend"
+echo "   cp .env.example .env   (ثم أضف مفاتيح API)"
+echo "   npm install"
+echo "   npm start"
+echo ""
+echo "2. في طرفية أخرى، شغّل الواجهة:"
+echo "   cd yalla-kora/frontend"
+echo "   cp .env.example .env"
+echo "   npm install"
+echo "   npm run dev"
+echo ""
+echo "سيتم فتح المتصفح تلقائياً على http://localhost:5173"
